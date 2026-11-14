@@ -528,6 +528,9 @@ components:
           type: array
           minItems: 1
           maxItems: 200
+          description: |
+            Тело запроса целиком не больше 100 МБ, это около 75 МБ реплеев до base64.
+            Больше дает 413 `payload_too_large` до проверки полей.
           items:
             $ref: '#/components/schemas/ReplayUpload'
 

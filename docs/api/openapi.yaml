@@ -1,0 +1,1157 @@
+openapi: 3.1.0
+
+info:
+  title: Sweet Soft, сервис прогона матчей
+  version: 0.1.0
+  description: |
+    HTTP API сервиса прогона матчей для бота StarCraft II. Сценарии и жизненный цикл Job
+    описаны в `docs/requirements.md`, компоненты в `docs/architecture.md`, контракт Tool
+    в `docs/tool-contract.md`.
+
+    Job это прогон, в API ресурс `/runs`. Работу Job выполняет Tool (исполнитель),
+    список доступных Tool отдает `GET /tools`.
+
+    **Ошибки.** Все ответы 4xx и 5xx приходят в одном формате `Error`:
+    `{"error": {"code", "message", "correlation_id", "details"}}`. По `code` клиент решает,
+    что делать, `message` написан для человека. `details` есть только у `invalid_params`:
+    это список полей, которые не прошли проверку.
+
+    Путь поля в `details[].field` считается от корня запроса: `tool`, `params`,
+    `params.bot_name`, `params.replays[3]`. Для query и заголовков: `query.limit`,
+    `header.Idempotency-Key`. Если тело не JSON, поле `body`.
+
+    | HTTP | `code` | Когда |
+    | --- | --- | --- |
+    | 404 | `run_not_found` | Job с таким id нет |
+    | 409 | `invalid_transition` | Переход запрещен жизненным циклом Job, например отмена завершенного Job |
+    | 409 | `idempotency_key_conflict` | `Idempotency-Key` уже привязан к запросу с другим телом |
+    | 413 | `payload_too_large` | Тело запроса больше 100 МБ |
+    | 422 | `invalid_params` | Тело, query или заголовок не прошли проверку, список полей в `details` |
+    | 422 | `unknown_tool` | Tool с таким именем нет в Registry |
+    | 500 | `internal_error` | Непредвиденная ошибка сервиса, подробности только в логе |
+    | 503 | `service_unavailable` | Недоступна БД |
+
+    **Correlation ID.** Клиент может передать заголовок `X-Correlation-ID`. Если его нет или он
+    не по формату, сервис создает свой. Значение возвращается в заголовке каждого ответа,
+    в теле ошибки, пишется в логи и в историю переходов Job.
+
+    **Повторный запрос.** `POST /runs` принимает заголовок `Idempotency-Key`. Повтор с тем же
+    ключом и тем же телом возвращает 200 и тот же Job, второй Job не создается. Решение и
+    его цена: `docs/adr/0001-idempotency-key.md`.
+
+servers:
+  - url: http://localhost:8000
+    description: Локальный запуск через Docker Compose
+
+tags:
+  - name: runs
+    description: Прогоны (Job)
+  - name: tools
+    description: Исполнители (Tool)
+  - name: service
+    description: Состояние сервиса
+
+paths:
+  /runs:
+    post:
+      tags: [runs]
+      operationId: createRun
+      summary: Создать прогон
+      description: |
+        Создает Job и ставит его в очередь. Ответ приходит сразу, работа идет в фоне:
+        статус и результат смотрят через `GET /runs/{run_id}`.
+
+        Порядок проверок:
+        1. Формат `Idempotency-Key`, размер тела, JSON и схема `CreateRunRequest`.
+           Ошибка: 413 `payload_too_large` или 422 `invalid_params`.
+        2. Если ключ уже привязан к Job: тело совпало, ответ 200 с этим Job;
+           тело другое, ответ 409 `idempotency_key_conflict`. Дальше проверки не идут.
+        3. Поиск Tool в Registry. Ошибка: 422 `unknown_tool`.
+        4. `validate(params)` у Tool. Ошибка: 422 `invalid_params` со списком полей.
+        5. Создание Job (`created`), постановка в очередь (`queued`), ответ 201.
+
+        Если запрос отклонен на шагах 1, 3 или 4, Job не создается и ключ остается свободным:
+        повтор с тем же ключом и исправленным телом создаст Job.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRunRequest'
+            examples:
+              series_summary:
+                summary: Процент побед по серии реплеев (сценарий 1)
+                value:
+                  tool: series_summary
+                  params:
+                    bot_name: X
+                    replays:
+                      - name: game01.SC2Replay
+                        content_base64: TVBRGwAAAAAAAAAAAAAAAAAA
+                      - name: game02.SC2Replay
+                        content_base64: TVBRGwAAAAAAAAAAAAAAAAAA
+              ab_compare:
+                summary: Сравнение двух версий бота (сценарий 2)
+                value:
+                  tool: ab_compare
+                  params:
+                    baseline_run_id: 5b1c8f0e-2d4a-4c1e-9f3a-7e2b6d0a1c11
+                    candidate_run_id: 9a7d3e2f-1b6c-4f8e-a0d5-3c4b2e1f0a22
+              arena_sync:
+                summary: Синхронизация с AI Arena (сценарий 3)
+                value:
+                  tool: arena_sync
+                  params:
+                    bot_id: 1234
+      responses:
+        '201':
+          description: Job создан и поставлен в очередь
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Run'
+              examples:
+                queued:
+                  $ref: '#/components/examples/RunQueued'
+        '200':
+          description: |
+            Повтор с тем же `Idempotency-Key` и тем же телом. Возвращается тот же Job в
+            текущем состоянии: это может быть уже не `queued`, а `running` или `done`.
+            Новый Job не создается, в очередь ничего не ставится, история не меняется.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+            Idempotent-Replayed:
+              description: Всегда `true`. Показывает, что ответ относится к уже созданному Job
+              schema:
+                type: string
+                const: 'true'
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Run'
+              examples:
+                running:
+                  $ref: '#/components/examples/RunRunning'
+        '409':
+          description: Ключ `Idempotency-Key` уже привязан к запросу с другим телом
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                idempotency_key_conflict:
+                  $ref: '#/components/examples/IdempotencyKeyConflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '422':
+          description: |
+            Запрос не прошел проверку, Job не создан. `invalid_params`: тело, заголовок или
+            параметры Tool не по формату, список полей в `details`. `unknown_tool`: Tool с
+            таким именем нет в Registry.
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                missing_bot_name:
+                  summary: Нет bot_name и пустой список реплеев (сценарий 1)
+                  value:
+                    error:
+                      code: invalid_params
+                      message: Параметры series_summary не прошли проверку
+                      correlation_id: 0f6c2a9e-4b7d-4e1a-8c3f-2d5b9e7a1f00
+                      details:
+                        - field: params.bot_name
+                          message: Обязательное поле
+                        - field: params.replays
+                          message: Нужно от 1 до 200 реплеев, передано 0
+                replay_too_large:
+                  summary: Реплей больше 5 МБ
+                  value:
+                    error:
+                      code: invalid_params
+                      message: Параметры series_summary не прошли проверку
+                      correlation_id: 0f6c2a9e-4b7d-4e1a-8c3f-2d5b9e7a1f00
+                      details:
+                        - field: params.replays[3]
+                          message: Реплей больше 5 МБ
+                missing_tool:
+                  summary: Не указано имя Tool (сценарий 4)
+                  value:
+                    error:
+                      code: invalid_params
+                      message: Тело запроса не прошло проверку
+                      correlation_id: 0f6c2a9e-4b7d-4e1a-8c3f-2d5b9e7a1f00
+                      details:
+                        - field: tool
+                          message: Обязательное поле
+                bad_idempotency_key:
+                  summary: Idempotency-Key не по формату
+                  value:
+                    error:
+                      code: invalid_params
+                      message: Заголовок Idempotency-Key не прошел проверку
+                      correlation_id: 0f6c2a9e-4b7d-4e1a-8c3f-2d5b9e7a1f00
+                      details:
+                        - field: header.Idempotency-Key
+                          message: Нужно от 1 до 255 печатных ASCII символов
+                unknown_tool:
+                  summary: Tool нет в Registry (сценарий 4)
+                  value:
+                    error:
+                      code: unknown_tool
+                      message: "Tool 'replay_stat' не найден, список доступных: GET /tools"
+                      correlation_id: 0f6c2a9e-4b7d-4e1a-8c3f-2d5b9e7a1f00
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+    get:
+      tags: [runs]
+      operationId: listRuns
+      summary: Список прогонов
+      description: |
+        Краткие сведения о Job, новые первыми (по `created_at`). Результат и историю
+        переходов отдает только `GET /runs/{run_id}`.
+      parameters:
+        - name: status
+          in: query
+          required: false
+          description: Только Job в этом состоянии
+          schema:
+            $ref: '#/components/schemas/RunStatus'
+        - name: tool
+          in: query
+          required: false
+          description: Только Job этого Tool
+          schema:
+            type: string
+            example: series_summary
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Страница списка Job
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunList'
+        '422':
+          description: Параметры query не прошли проверку, например `limit` больше 100
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: invalid_params
+                  message: Параметры запроса не прошли проверку
+                  correlation_id: 0f6c2a9e-4b7d-4e1a-8c3f-2d5b9e7a1f00
+                  details:
+                    - field: query.limit
+                      message: Нужно от 1 до 100, передано 500
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /runs/{run_id}:
+    get:
+      tags: [runs]
+      operationId: getRun
+      summary: Статус, результат и история прогона
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Job найден
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Run'
+              examples:
+                done:
+                  $ref: '#/components/examples/RunDone'
+                partial:
+                  $ref: '#/components/examples/RunPartial'
+                failed:
+                  $ref: '#/components/examples/RunFailed'
+        '404':
+          $ref: '#/components/responses/RunNotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /runs/{run_id}/cancel:
+    post:
+      tags: [runs]
+      operationId: cancelRun
+      summary: Отменить прогон
+      description: |
+        Переводит Job из `created`, `queued` или `running` в `cancelled`. У отмененного Job
+        нет результата. Если Tool в `running` успел закончить, его результат отбрасывается.
+
+        Из конечных состояний (`done`, `partial`, `failed`, `cancelled`) отмена запрещена,
+        ответ 409 `invalid_transition`, состояние и история не меняются. Повторная отмена
+        тоже получает 409: Job уже `cancelled`, его состояние видно в `GET /runs/{run_id}`.
+        `Idempotency-Key` эта операция не принимает.
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Job отменен
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Run'
+              examples:
+                cancelled:
+                  $ref: '#/components/examples/RunCancelled'
+        '404':
+          $ref: '#/components/responses/RunNotFound'
+        '409':
+          description: Job в конечном состоянии, отменять нечего (сценарий 6)
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: invalid_transition
+                  message: Нельзя отменить Job в состоянии done
+                  correlation_id: 0f6c2a9e-4b7d-4e1a-8c3f-2d5b9e7a1f00
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /tools:
+    get:
+      tags: [tools]
+      operationId: listTools
+      summary: Доступные исполнители
+      description: |
+        Все Tool из Registry и только они. Tool из выключенного профиля (например,
+        `local_match`) в списке нет.
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Список Tool
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolList'
+              example:
+                items:
+                  - name: series_summary
+                    description: Процент побед бота по серии реплеев, по картам и соперникам
+                  - name: ab_compare
+                    description: Разница процента побед между двумя сериями series_summary
+                  - name: arena_sync
+                    description: Забирает результаты матчей бота с ладдера AI Arena
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /health:
+    get:
+      tags: [service]
+      operationId: getHealth
+      summary: Состояние сервиса
+      description: Проверяет, что сервис отвечает и БД доступна.
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Сервис и БД работают
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+              example:
+                status: ok
+                checks:
+                  db: ok
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+components:
+  parameters:
+    RunId:
+      name: run_id
+      in: path
+      required: true
+      description: |
+        id Job из ответа `POST /runs`. Любой id, которого нет в хранилище, в том числе
+        строка не в формате UUID, дает 404 `run_not_found`.
+      schema:
+        type: string
+        example: 5b1c8f0e-2d4a-4c1e-9f3a-7e2b6d0a1c11
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Ключ повторного запроса. Клиент создает новый ключ на каждое новое задание и
+        отправляет тот же ключ при повторе (таймаут, обрыв связи, повторный запуск скрипта).
+        Рекомендуем UUID v4.
+
+        - Ключа нет: каждый запрос создает новый Job.
+        - Ключ новый: 201, ключ привязывается к созданному Job.
+        - Ключ уже привязан к Job и тело то же: 200, тот же Job.
+        - Ключ уже привязан к Job, а тело другое: 409 `idempotency_key_conflict`.
+        - Ключ не по формату: 422 `invalid_params`, поле `header.Idempotency-Key`.
+
+        Тело сравнивается по SHA-256 от `tool` и `params` в каноническом JSON (ключи
+        отсортированы, без пробелов), поэтому порядок полей в JSON не важен. Ключ живет,
+        пока живет Job. Подробности: `docs/adr/0001-idempotency-key.md`.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+        pattern: '^[!-~]+$'
+        example: 3f1d2c4b-8a7e-4f60-9b1d-2e5c7a9f0b13
+
+    CorrelationId:
+      name: X-Correlation-ID
+      in: header
+      required: false
+      description: |
+        Сквозной id запроса для логов. Если заголовка нет или он не по формату, сервис
+        создает свой. Ошибкой это не считается.
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9._-]{1,128}$'
+        example: 0f6c2a9e-4b7d-4e1a-8c3f-2d5b9e7a1f00
+
+  headers:
+    CorrelationId:
+      description: Correlation ID запроса, переданный клиентом или созданный сервисом
+      schema:
+        type: string
+        example: 0f6c2a9e-4b7d-4e1a-8c3f-2d5b9e7a1f00
+    Location:
+      description: Путь к Job, `/runs/{run_id}`
+      schema:
+        type: string
+        example: /runs/5b1c8f0e-2d4a-4c1e-9f3a-7e2b6d0a1c11
+
+  responses:
+    RunNotFound:
+      description: Job с таким id нет
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: run_not_found
+              message: "Job '5b1c8f0e-2d4a-4c1e-9f3a-7e2b6d0a1c11' не найден"
+              correlation_id: 0f6c2a9e-4b7d-4e1a-8c3f-2d5b9e7a1f00
+    PayloadTooLarge:
+      description: |
+        Тело запроса больше 100 МБ. Проверяется до разбора JSON, поэтому `details` нет.
+        Лимит взят с запасом под серию из 50 реплеев: реальный реплей меньше 1 МБ.
+        Лимит 5 МБ на один реплей проверяет `validate` у Tool, это 422 `invalid_params`.
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: payload_too_large
+              message: Тело запроса больше 100 МБ
+              correlation_id: 0f6c2a9e-4b7d-4e1a-8c3f-2d5b9e7a1f00
+    InternalError:
+      description: Непредвиденная ошибка сервиса. Подробности только в логе по `correlation_id`
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: internal_error
+              message: Внутренняя ошибка сервиса
+              correlation_id: 0f6c2a9e-4b7d-4e1a-8c3f-2d5b9e7a1f00
+    ServiceUnavailable:
+      description: |
+        Недоступна БД. Запрос не выполнен, Job не создан и не изменен, повтор безопасен.
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: service_unavailable
+              message: БД недоступна
+              correlation_id: 0f6c2a9e-4b7d-4e1a-8c3f-2d5b9e7a1f00
+
+  schemas:
+    Error:
+      type: object
+      description: Единый формат ошибки для всех ответов 4xx и 5xx
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, correlation_id]
+          properties:
+            code:
+              $ref: '#/components/schemas/ErrorCode'
+            message:
+              type: string
+              description: Описание для человека. Клиент не разбирает его, а смотрит на `code`
+            correlation_id:
+              type: string
+              description: Тот же, что в заголовке `X-Correlation-ID` ответа
+            details:
+              type: array
+              description: Только для `invalid_params`. Каждое поле, которое не прошло проверку
+              items:
+                $ref: '#/components/schemas/FieldError'
+
+    ErrorCode:
+      type: string
+      enum:
+        - invalid_params
+        - unknown_tool
+        - payload_too_large
+        - idempotency_key_conflict
+        - invalid_transition
+        - run_not_found
+        - internal_error
+        - service_unavailable
+
+    FieldError:
+      type: object
+      required: [field, message]
+      properties:
+        field:
+          type: string
+          description: |
+            Путь к полю от корня запроса. Для параметров Tool это `params.` и поле из
+            `ParamError.field`, который вернул `validate`.
+          examples: [tool, params.bot_name, 'params.replays[3]', query.limit, header.Idempotency-Key]
+        message:
+          type: string
+          description: Что не так с полем
+
+    CreateRunRequest:
+      type: object
+      required: [tool, params]
+      additionalProperties: false
+      properties:
+        tool:
+          type: string
+          minLength: 1
+          description: Имя Tool из `GET /tools`
+          example: series_summary
+        params:
+          type: object
+          description: |
+            Параметры Tool. Слой HTTP проверяет только, что это объект. Содержимое проверяет
+            `validate` у Tool, формат зависит от `tool`:
+            `series_summary` → `SeriesSummaryParams`, `ab_compare` → `AbCompareParams`,
+            `arena_sync` → `ArenaSyncParams`.
+
+    SeriesSummaryParams:
+      type: object
+      description: Параметры `series_summary`. Проверяет `validate`, ошибки идут в 422 `invalid_params`
+      required: [bot_name, replays]
+      properties:
+        bot_name:
+          type: string
+          minLength: 1
+          description: Имя бота в реплеях. По нему определяется, за какую сторону считать победу
+        replays:
+          type: array
+          minItems: 1
+          maxItems: 200
+          items:
+            $ref: '#/components/schemas/ReplayUpload'
+
+    ReplayUpload:
+      type: object
+      required: [name, content_base64]
+      properties:
+        name:
+          type: string
+          description: Имя файла, только для отчета о пропущенных реплеях
+          example: game01.SC2Replay
+        content_base64:
+          type: string
+          contentEncoding: base64
+          description: Содержимое файла `.SC2Replay` в base64, после декодирования не больше 5 МБ
+
+    AbCompareParams:
+      type: object
+      description: |
+        Параметры `ab_compare`. `validate` проверяет, что оба id есть и они разные.
+        Подходит ли Job источника (существует, это `series_summary`, он в `done` или `partial`),
+        проверяется уже в `run`: иначе Job уходит в `failed` с `invalid_source_run`.
+      required: [baseline_run_id, candidate_run_id]
+      properties:
+        baseline_run_id:
+          type: string
+          description: Job `series_summary` на старой версии бота
+        candidate_run_id:
+          type: string
+          description: Job `series_summary` на новой версии бота, не равен `baseline_run_id`
+
+    ArenaSyncParams:
+      type: object
+      description: Параметры `arena_sync`
+      required: [bot_id]
+      properties:
+        bot_id:
+          type: integer
+          minimum: 1
+          description: id бота на AI Arena
+
+    RunStatus:
+      type: string
+      description: |
+        Состояние Job. Конечные: `done`, `partial`, `failed`, `cancelled`. Разрешенные
+        переходы описаны в `docs/requirements.md`, раздел «Жизненный цикл Job».
+      enum: [created, queued, running, done, partial, failed, cancelled]
+
+    JobErrorCode:
+      type: string
+      description: Почему Job в `failed`
+      enum:
+        - external_unavailable
+        - external_bad_response
+        - invalid_source_run
+        - no_valid_replays
+        - internal_error
+
+    Run:
+      type: object
+      required:
+        - id
+        - tool
+        - params
+        - status
+        - created_at
+        - updated_at
+        - result
+        - error_code
+        - error_message
+        - history
+      properties:
+        id:
+          type: string
+          format: uuid
+        tool:
+          type: string
+        params:
+          type: object
+          description: |
+            Параметры из запроса. Реплеи возвращаются без содержимого: вместо
+            `content_base64` у каждого `ReplayRef`.
+        status:
+          $ref: '#/components/schemas/RunStatus'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+          description: Время последнего перехода
+        result:
+          description: Есть только в `done` и `partial`, в остальных состояниях `null`
+          oneOf:
+            - $ref: '#/components/schemas/RunResult'
+            - type: 'null'
+        error_code:
+          description: Есть только в `failed`, в остальных состояниях `null`
+          oneOf:
+            - $ref: '#/components/schemas/JobErrorCode'
+            - type: 'null'
+        error_message:
+          type: [string, 'null']
+          description: Описание причины `failed` для человека, например какой id источника не подошел и почему
+        history:
+          type: array
+          description: Все переходы по порядку. Первая запись это создание Job (`from` = `null`, `to` = `created`)
+          items:
+            $ref: '#/components/schemas/Transition'
+
+    ReplayRef:
+      type: object
+      description: Реплей в `params` ответа, без содержимого
+      required: [name, sha256, size_bytes]
+      properties:
+        name:
+          type: string
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: Хеш файла. По нему отсеиваются дубли
+        size_bytes:
+          type: integer
+
+    RunResult:
+      type: object
+      description: Результат Tool, повторяет `ToolResult` из контракта Tool
+      required: [data, skipped, warnings]
+      properties:
+        data:
+          type: object
+          description: |
+            Формат зависит от Tool: `series_summary` → `SeriesSummaryResult`,
+            `ab_compare` → `AbCompareResult`, `arena_sync` → `ArenaSyncResult`.
+        skipped:
+          type: array
+          description: Что Tool пропустил и почему. Не пусто только в `partial`
+          items:
+            $ref: '#/components/schemas/SkippedItem'
+        warnings:
+          type: array
+          description: Предупреждения, которые не меняют статус, например `low_sample`, `source_partial`
+          items:
+            type: string
+
+    SkippedItem:
+      type: object
+      required: [item, reason]
+      properties:
+        item:
+          type: string
+          description: Что пропущено, путь как в `FieldError.field`
+          example: 'params.replays[3]'
+        reason:
+          type: string
+          description: Почему пропущено
+          enum: [corrupted_replay, not_sc2_replay, bot_not_in_replay]
+
+    WinStats:
+      type: object
+      required: [total, wins, losses, draws, win_rate]
+      properties:
+        total:
+          type: integer
+          minimum: 0
+        wins:
+          type: integer
+          minimum: 0
+        losses:
+          type: integer
+          minimum: 0
+        draws:
+          type: integer
+          minimum: 0
+          description: Ничьи, включая матчи по лимиту времени без победителя
+        win_rate:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: '`wins / total × 100`, округление до 0,1'
+
+    SeriesSummaryResult:
+      description: '`data` у `series_summary`'
+      allOf:
+        - $ref: '#/components/schemas/WinStats'
+        - type: object
+          required: [by_map, by_opponent]
+          properties:
+            by_map:
+              type: object
+              description: Ключ это название карты
+              additionalProperties:
+                $ref: '#/components/schemas/WinStats'
+            by_opponent:
+              type: object
+              description: Ключ это имя соперника
+              additionalProperties:
+                $ref: '#/components/schemas/WinStats'
+
+    CompareRow:
+      type: object
+      required: [baseline, candidate, delta, only_in_one]
+      properties:
+        baseline:
+          description: '`null`, если в серии `baseline` таких матчей нет'
+          oneOf:
+            - $ref: '#/components/schemas/WinStats'
+            - type: 'null'
+        candidate:
+          description: '`null`, если в серии `candidate` таких матчей нет'
+          oneOf:
+            - $ref: '#/components/schemas/WinStats'
+            - type: 'null'
+        delta:
+          type: [number, 'null']
+          description: '`candidate.win_rate − baseline.win_rate` в п. п. `null`, если `only_in_one`'
+        only_in_one:
+          type: boolean
+          description: Карта или соперник есть только в одной из серий
+
+    AbCompareResult:
+      description: '`data` у `ab_compare`'
+      type: object
+      required: [overall, by_map, by_opponent]
+      properties:
+        overall:
+          $ref: '#/components/schemas/CompareRow'
+        by_map:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/CompareRow'
+        by_opponent:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/CompareRow'
+
+    ArenaSyncResult:
+      description: '`data` у `arena_sync`'
+      type: object
+      required: [fetched, new_matches]
+      properties:
+        fetched:
+          type: integer
+          minimum: 0
+          description: Сколько матчей вернула AI Arena
+        new_matches:
+          type: integer
+          minimum: 0
+          description: Сколько из них новых. Дубли по id матча на AI Arena не сохраняются
+
+    Transition:
+      type: object
+      required: [from, to, at, reason, correlation_id]
+      properties:
+        from:
+          description: '`null` у первой записи, это создание Job'
+          oneOf:
+            - $ref: '#/components/schemas/RunStatus'
+            - type: 'null'
+        to:
+          $ref: '#/components/schemas/RunStatus'
+        at:
+          type: string
+          format: date-time
+        reason:
+          type: [string, 'null']
+          description: Причина для `failed` и `cancelled`, в остальных случаях `null`
+        correlation_id:
+          type: string
+
+    RunSummary:
+      type: object
+      required: [id, tool, status, created_at, updated_at, error_code]
+      properties:
+        id:
+          type: string
+          format: uuid
+        tool:
+          type: string
+        status:
+          $ref: '#/components/schemas/RunStatus'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        error_code:
+          oneOf:
+            - $ref: '#/components/schemas/JobErrorCode'
+            - type: 'null'
+
+    RunList:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/RunSummary'
+        total:
+          type: integer
+          description: Сколько всего Job подходит под фильтр
+        limit:
+          type: integer
+        offset:
+          type: integer
+
+    ToolInfo:
+      type: object
+      required: [name, description]
+      properties:
+        name:
+          type: string
+          description: Имя для поля `tool` в `POST /runs`
+        description:
+          type: string
+
+    ToolList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ToolInfo'
+
+    Health:
+      type: object
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          const: ok
+        checks:
+          type: object
+          required: [db]
+          properties:
+            db:
+              type: string
+              const: ok
+
+  examples:
+    RunQueued:
+      summary: Job только что создан
+      value:
+        id: 5b1c8f0e-2d4a-4c1e-9f3a-7e2b6d0a1c11
+        tool: arena_sync
+        params:
+          bot_id: 1234
+        status: queued
+        created_at: '2026-11-14T10:00:00Z'
+        updated_at: '2026-11-14T10:00:00Z'
+        result: null
+        error_code: null
+        error_message: null
+        history:
+          - from: null
+            to: created
+            at: '2026-11-14T10:00:00Z'
+            reason: null
+            correlation_id: 0f6c2a9e-4b7d-4e1a-8c3f-2d5b9e7a1f00
+          - from: created
+            to: queued
+            at: '2026-11-14T10:00:00Z'
+            reason: null
+            correlation_id: 0f6c2a9e-4b7d-4e1a-8c3f-2d5b9e7a1f00
+
+    RunRunning:
+      summary: Повтор пришел, когда Job уже выполняется
+      value:
+        id: 5b1c8f0e-2d4a-4c1e-9f3a-7e2b6d0a1c11
+        tool: arena_sync
+        params:
+          bot_id: 1234
+        status: running
+        created_at: '2026-11-14T10:00:00Z'
+        updated_at: '2026-11-14T10:00:01Z'
+        result: null
+        error_code: null
+        error_message: null
+        history:
+          - from: null
+            to: created
+            at: '2026-11-14T10:00:00Z'
+            reason: null
+            correlation_id: 0f6c2a9e-4b7d-4e1a-8c3f-2d5b9e7a1f00
+          - from: created
+            to: queued
+            at: '2026-11-14T10:00:00Z'
+            reason: null
+            correlation_id: 0f6c2a9e-4b7d-4e1a-8c3f-2d5b9e7a1f00
+          - from: queued
+            to: running
+            at: '2026-11-14T10:00:01Z'
+            reason: null
+            correlation_id: 0f6c2a9e-4b7d-4e1a-8c3f-2d5b9e7a1f00
+
+    RunDone:
+      summary: series_summary на тестовом наборе из сценария 1
+      value:
+        id: 7c2e9a1b-3d5f-4a6b-8c7d-9e0f1a2b3c44
+        tool: series_summary
+        params:
+          bot_name: X
+          replays:
+            - name: game01.SC2Replay
+              sha256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+              size_bytes: 48213
+        status: done
+        created_at: '2026-11-14T10:00:00Z'
+        updated_at: '2026-11-14T10:00:07Z'
+        result:
+          data:
+            total: 10
+            wins: 7
+            losses: 2
+            draws: 1
+            win_rate: 70.0
+            by_map:
+              A: {total: 4, wins: 3, losses: 1, draws: 0, win_rate: 75.0}
+              B: {total: 6, wins: 4, losses: 1, draws: 1, win_rate: 66.7}
+            by_opponent:
+              Alpha: {total: 5, wins: 4, losses: 1, draws: 0, win_rate: 80.0}
+              Beta: {total: 5, wins: 3, losses: 1, draws: 1, win_rate: 60.0}
+          skipped: []
+          warnings: []
+        error_code: null
+        error_message: null
+        history:
+          - {from: null, to: created, at: '2026-11-14T10:00:00Z', reason: null, correlation_id: 1a2b3c4d}
+          - {from: created, to: queued, at: '2026-11-14T10:00:00Z', reason: null, correlation_id: 1a2b3c4d}
+          - {from: queued, to: running, at: '2026-11-14T10:00:01Z', reason: null, correlation_id: 1a2b3c4d}
+          - {from: running, to: done, at: '2026-11-14T10:00:07Z', reason: null, correlation_id: 1a2b3c4d}
+
+    RunPartial:
+      summary: series_summary, один реплей битый
+      value:
+        id: 8d3f0b2c-4e6a-4b7c-9d8e-0f1a2b3c4d55
+        tool: series_summary
+        params:
+          bot_name: X
+          replays:
+            - name: game01.SC2Replay
+              sha256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+              size_bytes: 48213
+            - name: broken.SC2Replay
+              sha256: 2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae
+              size_bytes: 1024
+        status: partial
+        created_at: '2026-11-14T10:00:00Z'
+        updated_at: '2026-11-14T10:00:03Z'
+        result:
+          data:
+            total: 1
+            wins: 1
+            losses: 0
+            draws: 0
+            win_rate: 100.0
+            by_map:
+              A: {total: 1, wins: 1, losses: 0, draws: 0, win_rate: 100.0}
+            by_opponent:
+              Alpha: {total: 1, wins: 1, losses: 0, draws: 0, win_rate: 100.0}
+          skipped:
+            - item: 'params.replays[1]'
+              reason: corrupted_replay
+          warnings: []
+        error_code: null
+        error_message: null
+        history:
+          - {from: null, to: created, at: '2026-11-14T10:00:00Z', reason: null, correlation_id: 2b3c4d5e}
+          - {from: created, to: queued, at: '2026-11-14T10:00:00Z', reason: null, correlation_id: 2b3c4d5e}
+          - {from: queued, to: running, at: '2026-11-14T10:00:01Z', reason: null, correlation_id: 2b3c4d5e}
+          - {from: running, to: partial, at: '2026-11-14T10:00:03Z', reason: null, correlation_id: 2b3c4d5e}
+
+    RunFailed:
+      summary: arena_sync, AI Arena не ответила за 3 попытки (сценарий 5)
+      value:
+        id: 9e4a1c3d-5f7b-4c8d-0e9f-1a2b3c4d5e66
+        tool: arena_sync
+        params:
+          bot_id: 1234
+        status: failed
+        created_at: '2026-11-14T10:00:00Z'
+        updated_at: '2026-11-14T10:00:35Z'
+        result: null
+        error_code: external_unavailable
+        error_message: AI Arena не ответила за 3 попытки
+        history:
+          - {from: null, to: created, at: '2026-11-14T10:00:00Z', reason: null, correlation_id: 3c4d5e6f}
+          - {from: created, to: queued, at: '2026-11-14T10:00:00Z', reason: null, correlation_id: 3c4d5e6f}
+          - {from: queued, to: running, at: '2026-11-14T10:00:01Z', reason: null, correlation_id: 3c4d5e6f}
+          - {from: running, to: failed, at: '2026-11-14T10:00:35Z', reason: external_unavailable, correlation_id: 3c4d5e6f}
+
+    RunCancelled:
+      summary: Job отменен в очереди
+      value:
+        id: 5b1c8f0e-2d4a-4c1e-9f3a-7e2b6d0a1c11
+        tool: arena_sync
+        params:
+          bot_id: 1234
+        status: cancelled
+        created_at: '2026-11-14T10:00:00Z'
+        updated_at: '2026-11-14T10:00:02Z'
+        result: null
+        error_code: null
+        error_message: null
+        history:
+          - {from: null, to: created, at: '2026-11-14T10:00:00Z', reason: null, correlation_id: 0f6c2a9e}
+          - {from: created, to: queued, at: '2026-11-14T10:00:00Z', reason: null, correlation_id: 0f6c2a9e}
+          - {from: queued, to: cancelled, at: '2026-11-14T10:00:02Z', reason: cancelled_by_user, correlation_id: 4d5e6f70}
+
+    IdempotencyKeyConflict:
+      summary: Тот же ключ, другое тело
+      value:
+        error:
+          code: idempotency_key_conflict
+          message: "Ключ уже использован для другого запроса, Job '5b1c8f0e-2d4a-4c1e-9f3a-7e2b6d0a1c11'. Для нового задания нужен новый ключ"
+          correlation_id: 0f6c2a9e-4b7d-4e1a-8c3f-2d5b9e7a1f00

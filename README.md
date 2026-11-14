@@ -43,3 +43,5 @@ API:
 | `GET /health` | состояние сервиса, включая проверку БД |
  
 Все ошибки приходят в одном формате: `{"error": {"code", "message", "correlation_id"}}`.
+
+Полный контракт API: [docs/api/openapi.yaml](docs/api/openapi.yaml). Как работает повторный запрос с `Idempotency-Key`: [ADR-0002](docs/adr/0002-idempotency-key.md).

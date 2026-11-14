@@ -146,7 +146,7 @@
 - `running`: dispatcher взял исполнителя из Registry, идет `run(params)`.
 - `done`: `run` вернул полный результат. Конечное состояние.
 - `partial`: результат есть, но часть входных данных пропущена, список пропущенного лежит в результате. Конечное состояние.
-- `failed`: результата нет, причина в `error_code` (`external_unavailable`, `external_bad_response`, `invalid_source_run`, `internal_error`). Конечное состояние.
+- `failed`: результата нет, причина в `error_code` (`external_unavailable`, `external_bad_response`, `invalid_source_run`, `no_valid_replays`, `internal_error`). Конечное состояние.
 - `cancelled`: Job отменен пользователем, результата нет. Конечное состояние.
 
 Разрешенные переходы:

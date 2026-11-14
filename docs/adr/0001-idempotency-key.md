@@ -1,4 +1,4 @@
-# ADR-0001. Защита от повторного POST /runs через Idempotency-Key
+# ADR-0002. Защита от повторного POST /runs через Idempotency-Key
 
 - Дата: 2026-11-14
 - Статус: принято

@@ -45,3 +45,21 @@ API:
 Все ошибки приходят в одном формате: `{"error": {"code", "message", "correlation_id"}}`.
 
 Полный контракт API: [docs/api/openapi.yaml](docs/api/openapi.yaml). Как работает повторный запрос с `Idempotency-Key`: [ADR-0002](docs/adr/0002-idempotency-key.md).
+
+## Запуск тестов
+
+Нужен Python 3.11 или новее. Один раз ставим зависимости, потом запускаем тесты одной командой:
+
+```bash
+make install
+make test
+```
+
+Если `make` нет (например, на Windows без Git Bash), то же самое без него:
+
+```bash
+python -m pip install -e ".[dev]"
+python -m pytest
+```
+
+Ядро лежит в `src/sweetsoft/core`, тесты в `tests`.

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, get_args, runtime_checkable
 
 
 @dataclass(frozen=True)
@@ -14,18 +14,37 @@ class ParamError:
     message: str  # что именно не так
 
 
+SkipReason = Literal["corrupted_replay", "not_sc2_replay", "bot_not_in_replay"]
+SKIP_REASONS: tuple[str, ...] = get_args(SkipReason)
+
+
+@dataclass(frozen=True)
+class SkippedItem:
+    """Что пропустили при partial и почему. В openapi.yaml это SkippedItem."""
+
+    item: str  # что пропущено, путь как в FieldError.field, например "params.replays[3]"
+    reason: SkipReason  # почему пропущено
+
+    def __post_init__(self) -> None:
+        if self.reason not in SKIP_REASONS:
+            raise ValueError(f"неизвестная причина пропуска: {self.reason!r}")
+
+
 @dataclass(frozen=True)
 class ToolResult:
     """Что вернул Tool. По status Dispatcher переводит Job в done или partial."""
 
     status: Literal["done", "partial"]
     data: dict[str, Any]  # сам результат, у каждого Tool свой формат
-    skipped: list[dict[str, str]] = field(default_factory=list)  # что пропустили и почему, только для partial
+    skipped: list[SkippedItem] = field(default_factory=list)  # что пропустили и почему, только для partial
     warnings: list[str] = field(default_factory=list)  # предупреждения, которые не меняют статус
 
     def __post_init__(self) -> None:
         if self.status not in ("done", "partial"):
             raise ValueError(f"неизвестный status результата: {self.status!r}")
+        for entry in self.skipped:
+            if not isinstance(entry, SkippedItem):
+                raise TypeError(f"элемент skipped должен быть SkippedItem, а не {type(entry).__name__}")
         if self.status == "partial" and not self.skipped:
             raise ValueError("partial без списка пропущенного")
         if self.status == "done" and self.skipped:

@@ -1,0 +1,27 @@
+"""Ошибки ядра.
+
+У каждой ошибки есть `code` из нашего контракта (requirements.md, openapi.yaml).
+HTTP слой на практике 4 переводит их в единый формат ошибки и HTTP код.
+"""
+
+
+class CoreError(Exception):
+    """Базовая ошибка ядра с кодом из контракта."""
+
+    code = "internal_error"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+class InvalidTransition(CoreError):
+    """Переход Job запрещен жизненным циклом. В API это 409."""
+
+    code = "invalid_transition"
+
+    def __init__(self, job_id: str, from_state: str, to_state: str) -> None:
+        super().__init__(f"Job {job_id}: переход {from_state} -> {to_state} запрещен")
+        self.job_id = job_id
+        self.from_state = from_state
+        self.to_state = to_state

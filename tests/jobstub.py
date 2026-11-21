@@ -24,18 +24,28 @@ ALLOWED = {
 }
 
 
+@dataclass(frozen=True)
+class Transition:
+    from_state: str
+    to_state: str
+    reason: str | None
+    correlation_id: str
+
+
 @dataclass
 class StubJob:
     id: str
     tool: str
     params: dict[str, Any] = field(default_factory=dict)
     state: str = "created"
+    correlation_id: str = "corr-create"
     result: ToolResult | None = None
     error_code: str | None = None
-    history: list[tuple[str, str, str | None]] = field(default_factory=list)
+    error_message: str | None = None
+    history: list[Transition] = field(default_factory=list)
 
-    def transition(self, to_state: str, *, reason: str | None = None) -> None:
+    def transition(self, to_state: str, *, reason: str | None = None, correlation_id: str | None = None) -> None:
         if (self.state, to_state) not in ALLOWED:
             raise InvalidTransition(self.id, self.state, to_state)
-        self.history.append((self.state, to_state, reason))
+        self.history.append(Transition(self.state, to_state, reason, correlation_id or self.correlation_id))
         self.state = to_state

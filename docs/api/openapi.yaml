@@ -631,7 +631,7 @@ components:
         bot_name:
           type: string
           minLength: 1
-          description: Имя бота в реплеях. По нему определяется, за какую сторону считать победу
+          description: Имя бота в реплеях, без пробелов в начале и в конце. По нему определяется, за какую сторону считать победу
         replays:
           type: array
           minItems: 1
@@ -795,7 +795,7 @@ components:
         reason:
           type: string
           description: Почему пропущено
-          enum: [corrupted_replay, not_sc2_replay, bot_not_in_replay]
+          enum: [corrupted_replay, not_sc2_replay, bot_not_in_replay, not_1v1]
 
     WinStats:
       type: object

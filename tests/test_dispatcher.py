@@ -5,9 +5,8 @@ from __future__ import annotations
 from typing import Any, Callable
 
 import pytest
-from jobstub import StubJob
 
-from sweetsoft.core import ParamError, RunContext, SkippedItem, ToolError, ToolResult
+from sweetsoft.core import Job, ParamError, RunContext, SkippedItem, ToolError, ToolResult
 from sweetsoft.core.dispatcher import RESTART_MESSAGE, Dispatcher, recover_after_restart
 from sweetsoft.core.errors import InvalidTransition
 from sweetsoft.core.registry import Registry
@@ -35,8 +34,8 @@ def done(context: RunContext) -> ToolResult:
     return ToolResult(status="done", data={"total": 10})
 
 
-def queued_job(store: InMemoryJobStore, job_id: str, tool: str) -> StubJob:
-    job = StubJob(id=job_id, tool=tool, correlation_id=f"corr-{job_id}")
+def queued_job(store: InMemoryJobStore, job_id: str, tool: str) -> Job:
+    job = Job.create(tool, {}, f"corr-{job_id}", job_id=job_id)
     store.add(job)
     store.transition(job_id, "queued")
     return job
@@ -57,6 +56,7 @@ def test_normal_path_from_created_to_done():
     assert job.state == "done"
     assert job.result.data == {"total": 10}
     assert [(t.from_state, t.to_state) for t in job.history] == [
+        (None, "created"),
         ("created", "queued"),
         ("queued", "running"),
         ("running", "done"),

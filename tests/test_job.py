@@ -11,6 +11,7 @@ from sweetsoft.core import (
     InvalidTransition,
     Job,
     JobState,
+    SkippedItem,
     ToolResult,
 )
 
@@ -20,7 +21,7 @@ DONE_RESULT = ToolResult(status="done", data={"total": 10, "wins": 7})
 PARTIAL_RESULT = ToolResult(
     status="partial",
     data={"total": 9, "wins": 6},
-    skipped=[{"item": "replays[3]", "reason": "corrupted_replay"}],
+    skipped=[SkippedItem(item="replays[3]", reason="corrupted_replay")],
 )
 
 

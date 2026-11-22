@@ -25,3 +25,13 @@ class InvalidTransition(CoreError):
         self.job_id = job_id
         self.from_state = from_state
         self.to_state = to_state
+
+
+class UnknownTool(CoreError):
+    """Tool с таким именем нет в Registry. В API это 422."""
+
+    code = "unknown_tool"
+
+    def __init__(self, name: str) -> None:
+        super().__init__(f"Tool '{name}' не найден, список доступных: GET /tools")
+        self.name = name

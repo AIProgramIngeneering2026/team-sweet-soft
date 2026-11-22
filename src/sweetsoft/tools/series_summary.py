@@ -76,13 +76,19 @@ class SeriesSummary:
                 skipped.append(SkippedItem(path, exc.reason))
                 continue
 
+            # Считаем только матчи 1 на 1, как на AI Arena. В командной игре первый
+            # игрок не бот может оказаться союзником, поэтому такие реплеи пропускаем явно
+            if len(replay.players) != 2:
+                skipped.append(SkippedItem(path, "not_1v1"))
+                continue
+
             bot = next((p for p in replay.players if p.name == bot_name), None)
             if bot is None:
                 skipped.append(SkippedItem(path, "bot_not_in_replay"))
                 continue
             opponent = next((p.name for p in replay.players if p.name != bot_name), None)
             if opponent is None:
-                # В реплее только сам бот, соперника не определить
+                # Оба игрока с именем bot_name, соперника не определить
                 skipped.append(SkippedItem(path, "corrupted_replay"))
                 continue
 

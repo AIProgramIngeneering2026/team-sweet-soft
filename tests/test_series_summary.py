@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 import pytest
@@ -111,6 +112,23 @@ def test_skip_reasons(tool):
         SkippedItem("params.replays[3]", "corrupted_replay"),
     ]
     assert result.data["total"] == 1
+
+
+@pytest.mark.parametrize(
+    "players",
+    [
+        [["X", "win"], ["Ally", "win"], ["E1", "loss"], ["E2", "loss"]],  # 2 на 2
+        [["X", "win"], ["E1", "loss"], ["E2", "loss"]],  # каждый сам за себя
+        [["X", "win"]],
+    ],
+)
+def test_not_1v1_replay_is_skipped(tool, players):
+    team_game = json.dumps({"map": "A", "players": players}).encode()
+    result = tool.run(params(game("A", "Alpha", "win"), team_game), Context())
+
+    assert result.status == "partial"
+    assert result.skipped == [SkippedItem("params.replays[1]", "not_1v1")]
+    assert list(result.data["by_opponent"]) == ["Alpha"]
 
 
 def test_duplicates_are_counted_once_silently(tool, parser):

@@ -14,7 +14,7 @@ class ParamError:
     message: str  # что именно не так
 
 
-SkipReason = Literal["corrupted_replay", "not_sc2_replay", "bot_not_in_replay"]
+SkipReason = Literal["corrupted_replay", "not_sc2_replay", "bot_not_in_replay", "not_1v1"]
 SKIP_REASONS: tuple[str, ...] = get_args(SkipReason)
 
 

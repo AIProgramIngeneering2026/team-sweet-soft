@@ -27,8 +27,17 @@ class Job(Protocol):
     error_code: str | None
     error_message: str | None  # текст для человека, в API это Run.error_message
 
-    def transition(self, to_state: str, *, reason: str | None = None, correlation_id: str | None = None) -> None:
-        """Перейти в to_state и записать переход в историю или бросить InvalidTransition.
+    def transition(
+        self,
+        to_state: str,
+        *,
+        reason: str | None = None,
+        correlation_id: str | None = None,
+        result: ToolResult | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        """Перейти в to_state, записать переход и итог или бросить InvalidTransition.
 
         reason это код причины (`external_unavailable`, `internal_error`), а не текст.
         """
@@ -93,13 +102,14 @@ class InMemoryJobStore:
     ) -> Job:
         with self._lock:
             job = self._jobs[job_id]
-            job.transition(to_state, reason=reason, correlation_id=correlation_id)
-            if result is not None:
-                job.result = result
-            if error_code is not None:
-                job.error_code = error_code
-            if error_message is not None:
-                job.error_message = error_message
+            job.transition(
+                to_state,
+                reason=reason,
+                correlation_id=correlation_id,
+                result=result,
+                error_code=error_code,
+                error_message=error_message,
+            )
             return job
 
     def claim_next(self) -> Job | None:

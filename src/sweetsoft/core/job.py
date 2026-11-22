@@ -26,6 +26,10 @@ class JobState(str, Enum):
     FAILED = "failed"
     CANCELLED = "cancelled"
 
+    def __str__(self) -> str:
+        # С Python 3.11 f"{JobState.RUNNING}" без этого даёт "JobState.RUNNING".
+        return self.value
+
 
 TERMINAL_STATES: frozenset[JobState] = frozenset(
     {JobState.DONE, JobState.PARTIAL, JobState.FAILED, JobState.CANCELLED}
@@ -108,13 +112,22 @@ class Job:
         reason: str | None = None,
         correlation_id: str | None = None,
         at: datetime | None = None,
+        result: ToolResult | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
     ) -> None:
-        """Общий переход по таблице.
+        """Общий переход по таблице и запись итога в одном месте.
 
         Строку приводим к JobState: хранилище передает состояние строкой, как в
         контракте (ADR-0001). Неизвестное имя это тоже запрещенный переход.
         """
         self._move(to_state, correlation_id or self.correlation_id, at, reason)
+        if result is not None:
+            self.result = result
+        if error_code is not None:
+            self.error_code = error_code
+        if error_message is not None:
+            self.error_message = error_message
 
     def enqueue(self, correlation_id: str, at: datetime | None = None) -> None:
         """created -> queued: Job сохранен и поставлен в очередь."""
@@ -129,8 +142,7 @@ class Job:
     ) -> None:
         """running -> done или partial, смотря что вернул Tool."""
         to_state = JobState.DONE if result.status == "done" else JobState.PARTIAL
-        self._move(to_state, correlation_id, at)
-        self.result = result
+        self.transition(to_state, correlation_id=correlation_id, at=at, result=result)
 
     def fail(
         self,
@@ -143,18 +155,23 @@ class Job:
 
         В историю пишем код причины, текст для человека живет в error_message.
         """
-        self._move(JobState.FAILED, correlation_id, at, reason=error_code)
-        self.error_code = error_code
-        self.error_message = error_message
+        self.transition(
+            JobState.FAILED,
+            reason=error_code,
+            correlation_id=correlation_id,
+            at=at,
+            error_code=error_code,
+            error_message=error_message,
+        )
 
     def cancel(
         self,
         correlation_id: str,
-        reason: str = "отменен пользователем",
+        reason: str = "cancelled_by_user",
         at: datetime | None = None,
     ) -> None:
         """created, queued или running -> cancelled. У cancelled нет результата."""
-        self._move(JobState.CANCELLED, correlation_id, at, reason=reason)
+        self.transition(JobState.CANCELLED, reason=reason, correlation_id=correlation_id, at=at)
         self.result = None
 
     def _move(

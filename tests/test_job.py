@@ -128,7 +128,7 @@ def test_cancel_allowed_from_not_finished_states(state):
     assert job.state is JobState.CANCELLED
     assert job.result is None
     assert job.history[-1].from_state is state
-    assert job.history[-1].reason
+    assert job.history[-1].reason == "cancelled_by_user"
 
 
 # Таблица переходов целиком
@@ -217,4 +217,10 @@ def test_transition_with_unknown_state_is_rejected():
     job = Job.create("series_summary", {"bot_name": "X"}, CID)
 
     assert_rejected(job, lambda j: j.transition("teleported"))
+
+
+def test_state_formats_as_value_for_messages():
+    # С Python 3.11 f-string на str Enum по умолчанию даёт "JobState.RUNNING"
+    assert f"{JobState.RUNNING}" == "running"
+    assert str(JobState.CANCELLED) == "cancelled"
 

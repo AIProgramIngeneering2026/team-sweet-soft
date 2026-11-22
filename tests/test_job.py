@@ -77,6 +77,7 @@ def test_create_job_is_created_with_first_history_record():
     job = Job.create("series_summary", {"bot_name": "X"}, CID)
 
     assert job.state is JobState.CREATED
+    assert job.correlation_id == CID
     assert len(job.history) == 1
     assert job.history[0].from_state is None
     assert job.history[0].to_state is JobState.CREATED
@@ -114,7 +115,8 @@ def test_fail_keeps_error_code_and_reason():
 
     assert job.state is JobState.FAILED
     assert job.error_code == "external_unavailable"
-    assert job.history[-1].reason == "AI Arena не отвечает"
+    assert job.error_message == "AI Arena не отвечает"
+    assert job.history[-1].reason == "external_unavailable"
     assert job.result is None
 
 
@@ -198,4 +200,21 @@ def test_villain_6_finished_job_cannot_run_again(state):
 
     assert_rejected(job, lambda j: j.start(CID))
     assert_rejected(job, lambda j: j.enqueue(CID))
+
+
+# Общий переход строкой, так его вызывает хранилище
+
+
+def test_transition_accepts_state_as_string():
+    job = Job.create("series_summary", {"bot_name": "X"}, CID)
+    job.transition("queued")
+
+    assert job.state is JobState.QUEUED
+    assert job.history[-1].correlation_id == CID
+
+
+def test_transition_with_unknown_state_is_rejected():
+    job = Job.create("series_summary", {"bot_name": "X"}, CID)
+
+    assert_rejected(job, lambda j: j.transition("teleported"))
 

@@ -66,6 +66,7 @@ class Job:
     tool: str
     params: dict[str, Any]
     state: JobState
+    correlation_id: str  # correlation_id запроса, который создал Job
     history: list[Transition] = field(default_factory=list)
     result: ToolResult | None = None
     error_code: str | None = None
@@ -86,6 +87,7 @@ class Job:
             tool=tool,
             params=params,
             state=JobState.CREATED,
+            correlation_id=correlation_id,
         )
         job.history.append(
             Transition(None, JobState.CREATED, at or _now(), correlation_id)
@@ -98,6 +100,21 @@ class Job:
 
     def can_move_to(self, to_state: JobState) -> bool:
         return to_state in ALLOWED_TRANSITIONS[self.state]
+
+    def transition(
+        self,
+        to_state: JobState | str,
+        *,
+        reason: str | None = None,
+        correlation_id: str | None = None,
+        at: datetime | None = None,
+    ) -> None:
+        """Общий переход по таблице.
+
+        Строку приводим к JobState: хранилище передает состояние строкой, как в
+        контракте (ADR-0001). Неизвестное имя это тоже запрещенный переход.
+        """
+        self._move(to_state, correlation_id or self.correlation_id, at, reason)
 
     def enqueue(self, correlation_id: str, at: datetime | None = None) -> None:
         """created -> queued: Job сохранен и поставлен в очередь."""
@@ -122,8 +139,11 @@ class Job:
         correlation_id: str,
         at: datetime | None = None,
     ) -> None:
-        """running -> failed: ошибка Tool, AI Arena или перезапуск сервиса."""
-        self._move(JobState.FAILED, correlation_id, at, reason=error_message)
+        """running -> failed: ошибка Tool, AI Arena или перезапуск сервиса.
+
+        В историю пишем код причины, текст для человека живет в error_message.
+        """
+        self._move(JobState.FAILED, correlation_id, at, reason=error_code)
         self.error_code = error_code
         self.error_message = error_message
 
@@ -139,11 +159,16 @@ class Job:
 
     def _move(
         self,
-        to_state: JobState,
+        to_state: JobState | str,
         correlation_id: str,
         at: datetime | None,
         reason: str | None = None,
     ) -> None:
+        if not isinstance(to_state, JobState):
+            try:
+                to_state = JobState(to_state)
+            except ValueError:
+                raise InvalidTransition(self.id, self.state.value, str(to_state)) from None
         if not self.can_move_to(to_state):
             raise InvalidTransition(self.id, self.state.value, to_state.value)
         self.history.append(

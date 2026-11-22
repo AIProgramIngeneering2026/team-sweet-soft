@@ -34,6 +34,9 @@ class SeriesSummary:
             errors.append(ParamError("bot_name", "обязательное поле"))
         elif not isinstance(bot_name, str) or not bot_name.strip():
             errors.append(ParamError("bot_name", "ожидается непустая строка"))
+        elif bot_name != bot_name.strip():
+            # run сравнивает имя с реплеями как есть, " X" там не найдется
+            errors.append(ParamError("bot_name", "без пробелов в начале и в конце"))
 
         replays = params.get("replays")
         if "replays" not in params:

@@ -148,7 +148,7 @@ def test_missing_bot_name_and_empty_replays(tool):
     assert fields(tool.validate({"replays": []})) == ["bot_name", "replays"]
 
 
-@pytest.mark.parametrize("bot_name", ["", "   ", 42, None])
+@pytest.mark.parametrize("bot_name", ["", "   ", 42, None, " X", "X ", "\tX"])
 def test_bad_bot_name(tool, bot_name):
     p = params(game("A", "Alpha", "win"))
     p["bot_name"] = bot_name

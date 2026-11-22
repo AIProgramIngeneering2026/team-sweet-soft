@@ -134,11 +134,28 @@ def test_cancel_allowed_from_not_finished_states(state):
 # Таблица переходов целиком
 
 
+# Таблица из docs/requirements.md, записана в тесте отдельно от кода. Если
+# сверять запрещенные переходы с самой ALLOWED_TRANSITIONS, случайно разрешенный
+# переход станет «разрешенным» и тест его пропустит.
+EXPECTED_ALLOWED = {
+    (JobState.CREATED, JobState.QUEUED),
+    (JobState.CREATED, JobState.CANCELLED),
+    (JobState.QUEUED, JobState.RUNNING),
+    (JobState.QUEUED, JobState.CANCELLED),
+    (JobState.RUNNING, JobState.DONE),
+    (JobState.RUNNING, JobState.PARTIAL),
+    (JobState.RUNNING, JobState.FAILED),
+    (JobState.RUNNING, JobState.CANCELLED),
+}
+
 ALL_PAIRS = list(itertools.product(JobState, MOVES))
-FORBIDDEN = [
-    (src, dst) for src, dst in ALL_PAIRS if dst not in ALLOWED_TRANSITIONS[src]
-]
-ALLOWED = [(src, dst) for src, dst in ALL_PAIRS if dst in ALLOWED_TRANSITIONS[src]]
+FORBIDDEN = [(src, dst) for src, dst in ALL_PAIRS if (src, dst) not in EXPECTED_ALLOWED]
+ALLOWED = [(src, dst) for src, dst in ALL_PAIRS if (src, dst) in EXPECTED_ALLOWED]
+
+
+def test_allowed_transitions_match_requirements():
+    actual = {(src, dst) for src in JobState for dst in ALLOWED_TRANSITIONS[src]}
+    assert actual == EXPECTED_ALLOWED
 
 
 @pytest.mark.parametrize(("src", "dst"), ALLOWED, ids=lambda s: s.value)

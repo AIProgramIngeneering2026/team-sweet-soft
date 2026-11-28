@@ -5,3 +5,5 @@ venv/
 *.egg-info/
 .pytest_cache/
 .env
+/sweetsoft.sqlite3
+/sweetsoft.sqlite3-*

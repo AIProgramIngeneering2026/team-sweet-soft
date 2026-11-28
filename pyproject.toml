@@ -7,7 +7,7 @@ name = "sweetsoft"
 version = "0.1.0"
 description = "Сервис прогона матчей для бота StarCraft II"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["alembic>=1.13,<2", "SQLAlchemy>=2,<3"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]

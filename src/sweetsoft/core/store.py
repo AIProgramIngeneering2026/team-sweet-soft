@@ -1,7 +1,7 @@
 """Хранилище Job.
 
-Ядро работает с хранилищем только через интерфейс JobStore. Сейчас есть реализация
-в памяти, на практике 4 появится реализация на БД с тем же интерфейсом.
+Ядро работает с хранилищем только через интерфейс JobStore. Реализация в памяти
+используется в модульных тестах.
 
 Правила переходов живут в Job. Хранилище только делает проверку и запись атомарной:
 два потока не могут одновременно перевести один Job (ADR-0001).
@@ -10,8 +10,10 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Sequence
 from typing import Any, Protocol
 
+from sweetsoft.core.job import Transition
 from sweetsoft.core.tool import ToolResult
 
 
@@ -21,11 +23,16 @@ class Job(Protocol):
     id: str
     tool: str
     params: dict[str, Any]
-    state: str
     correlation_id: str  # correlation_id запроса, который создал Job
     result: ToolResult | None
     error_code: str | None
     error_message: str | None  # текст для человека, в API это Run.error_message
+
+    @property
+    def state(self) -> str: ...
+
+    @property
+    def history(self) -> Sequence[Transition]: ...
 
     def transition(
         self,

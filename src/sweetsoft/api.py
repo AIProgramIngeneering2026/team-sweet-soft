@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 
 from sweetsoft.storage import create_job_store
+from sweetsoft.storage.sql import SchemaVersionMismatch
 
 CORRELATION_ID = re.compile(r"[A-Za-z0-9._-]{1,128}")
 
@@ -36,13 +37,14 @@ app = FastAPI(title="Sweet Soft", lifespan=lifespan)
 )
 def get_health(request: Request) -> JSONResponse:
     correlation_id = request.headers.get("X-Correlation-ID", "")
+    # По OpenAPI (CorrelationId) при отсутствующем или неверном заголовке сервис создаёт свой ID.
     if not CORRELATION_ID.fullmatch(correlation_id):
         correlation_id = str(uuid4())
     headers = {"X-Correlation-ID": correlation_id}
 
     try:
         request.app.state.job_store.check_health()
-    except SQLAlchemyError:
+    except (SQLAlchemyError, SchemaVersionMismatch):
         return JSONResponse(
             status_code=503,
             headers=headers,

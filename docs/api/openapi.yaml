@@ -411,7 +411,7 @@ paths:
       tags: [service]
       operationId: getHealth
       summary: Состояние сервиса
-      description: Проверяет, что сервис отвечает и БД доступна.
+      description: Проверяет доступ к БД и соответствие её схемы актуальным ревизиям Alembic.
       parameters:
         - $ref: '#/components/parameters/CorrelationId'
       responses:

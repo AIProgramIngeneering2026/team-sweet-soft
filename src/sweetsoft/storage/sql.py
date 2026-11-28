@@ -8,12 +8,18 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 
+from alembic.migration import MigrationContext
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine, RowMapping
 
 from sweetsoft.core.job import Job, JobState, Transition
 from sweetsoft.core.store import Job as StoredJob
 from sweetsoft.core.tool import SkippedItem, ToolResult
+from sweetsoft.migrations import migration_heads
+
+
+class SchemaVersionMismatch(RuntimeError):
+    """В базе применён другой набор ревизий Alembic."""
 
 
 class SQLJobStore:
@@ -30,7 +36,7 @@ class SQLJobStore:
             with connection.begin():
                 if self._sqlite:
                     connection.exec_driver_sql("PRAGMA foreign_keys = ON")
-                    # Блокировку записи берем до чтения состояния Job и очереди.
+                    # Второй писатель ждёт конца транзакции и читает уже обновлённую очередь.
                     connection.exec_driver_sql("BEGIN IMMEDIATE" if write else "BEGIN")
                 yield connection
 
@@ -38,8 +44,12 @@ class SQLJobStore:
         self._engine.dispose()
 
     def check_health(self) -> None:
-        """Проверить доступ к обеим таблицам схемы."""
+        """Проверить ревизии Alembic и доступ к таблицам прогонов."""
         with self._transaction() as connection:
+            expected = migration_heads()
+            current = MigrationContext.configure(connection).get_current_heads()
+            if not expected or frozenset(current) != expected:
+                raise SchemaVersionMismatch("База не на актуальной ревизии Alembic")
             connection.execute(text("SELECT 1 FROM jobs LIMIT 1")).first()
             connection.execute(text("SELECT 1 FROM job_transitions LIMIT 1")).first()
 

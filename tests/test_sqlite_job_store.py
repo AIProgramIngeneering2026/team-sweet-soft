@@ -3,11 +3,12 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Barrier
+from threading import Event
 
 import pytest
 from alembic import command
 from alembic.config import Config
+from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from sweetsoft.core.dispatcher import INTERNAL_ERROR, RESTART_MESSAGE, recover_after_restart
@@ -128,20 +129,40 @@ def test_claim_next_uses_creation_order_and_cannot_claim_twice(migrated_db):
     older = queued_job(store, at=now - timedelta(seconds=10))
     assert store.claim_next().id == older.id
 
-    barrier = Barrier(2, timeout=5)
+    other_store = SQLiteJobStore(migrated_db)
+    before_select = Event()
+    other_begin = Event()
+    resume = Event()
 
-    def claim():
-        worker_store = SQLiteJobStore(migrated_db)
-        barrier.wait()
-        return worker_store.claim_next()
+    @event.listens_for(store._engine, "before_cursor_execute")
+    def pause_before_select(_connection, _cursor, statement, *_):
+        if statement.startswith("SELECT * FROM jobs WHERE state"):
+            before_select.set()
+            assert resume.wait(timeout=5)
+
+    @event.listens_for(other_store._engine, "before_cursor_execute")
+    def record_other_begin(_connection, _cursor, statement, *_):
+        if statement == "BEGIN IMMEDIATE":
+            other_begin.set()
 
     with ThreadPoolExecutor(max_workers=2) as workers:
-        first = workers.submit(claim)
-        second = workers.submit(claim)
-        claimed = [job for job in (first.result(), second.result()) if job is not None]
+        try:
+            first = workers.submit(store.claim_next)
+            assert before_select.wait(timeout=5)
+            # Первый воркер ещё не выполнил SELECT, но SQLite уже держит блокировку записи.
+            with closing(sqlite3.connect(migrated_db, timeout=0)) as probe:
+                with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+                    probe.execute("BEGIN IMMEDIATE")
+            second = workers.submit(other_store.claim_next)
+            assert other_begin.wait(timeout=5)
+        finally:
+            resume.set()
 
-    assert [job.id for job in claimed] == [newer.id]
-    assert store.get(newer.id).history[-1].to_state == JobState.RUNNING
+        assert first.result().id == newer.id
+        assert second.result() is None
+
+    history = store.get(newer.id).history
+    assert [item.to_state for item in history] == [JobState.CREATED, JobState.QUEUED, JobState.RUNNING]
 
 
 def test_rejected_transition_preserves_cancelled_job(migrated_db):

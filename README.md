@@ -57,7 +57,7 @@ python -m alembic upgrade head
 python -m uvicorn sweetsoft.api:app
 ```
 
-`GET /health` возвращает `200`, когда доступны таблицы прогонов и истории, и `503 service_unavailable` при ошибке БД. `SQLiteJobStore` и `PostgreSQLJobStore` реализуют `JobStore`. Оба записывают состояние, результат или ошибку и историю одной транзакцией. Для модульных тестов доступен `InMemoryJobStore`.
+`GET /health` возвращает `200`, когда доступны таблицы прогонов и истории и применены актуальные ревизии Alembic. При недоступной БД или несовпадении ревизий возвращает `503 service_unavailable`. `SQLiteJobStore` и `PostgreSQLJobStore` реализуют `JobStore`. Оба записывают состояние, результат или ошибку и историю одной транзакцией. Для модульных тестов доступен `InMemoryJobStore`.
 
 ## Запуск тестов
 

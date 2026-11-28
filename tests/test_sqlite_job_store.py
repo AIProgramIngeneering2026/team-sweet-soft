@@ -8,6 +8,7 @@ from threading import Barrier
 import pytest
 from alembic import command
 from alembic.config import Config
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from sweetsoft.core.dispatcher import INTERNAL_ERROR, RESTART_MESSAGE, recover_after_restart
 from sweetsoft.core.errors import InvalidTransition
@@ -19,6 +20,7 @@ from sweetsoft.storage import SQLiteJobStore
 @pytest.fixture
 def db_path(tmp_path, monkeypatch):
     path = tmp_path / "тестовая база.sqlite3"
+    monkeypatch.delenv("SWEETSOFT_DATABASE_URL", raising=False)
     monkeypatch.setenv("SWEETSOFT_DB_PATH", str(path))
     return path
 
@@ -42,7 +44,7 @@ def queued_job(store, *, at=None):
 
 def test_upgrade_empty_database(db_path, migration_config):
     store = SQLiteJobStore()
-    with pytest.raises(sqlite3.OperationalError):
+    with pytest.raises(OperationalError):
         store.check_health()
     assert not db_path.exists()
 
@@ -108,7 +110,7 @@ def test_history_write_failure_rolls_back_state_and_result(migrated_db):
         )
 
     result = ToolResult("done", {"total": 1})
-    with pytest.raises(sqlite3.IntegrityError, match="history write failed"):
+    with pytest.raises(IntegrityError, match="history write failed"):
         store.transition(queued.id, JobState.DONE, result=result)
     assert SQLiteJobStore(migrated_db).get(queued.id) == running
 

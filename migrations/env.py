@@ -1,9 +1,9 @@
 from alembic import context
-from sqlalchemy import URL, create_engine, pool
+from sqlalchemy import create_engine, pool
 
-from sweetsoft.storage.sqlite import database_path
+from sweetsoft.storage.settings import database_url
 
-url = URL.create("sqlite", database=str(database_path().resolve()))
+url = database_url()
 
 if context.is_offline_mode():
     context.configure(url=url, literal_binds=True)
@@ -12,8 +12,9 @@ if context.is_offline_mode():
 else:
     engine = create_engine(url, poolclass=pool.NullPool)
     with engine.begin() as connection:
-        # sqlite3 не начинает транзакцию автоматически для DDL.
-        connection.exec_driver_sql("BEGIN")
+        if connection.dialect.name == "sqlite":
+            # sqlite3 не начинает транзакцию автоматически для DDL.
+            connection.exec_driver_sql("BEGIN")
         context.configure(connection=connection, transactional_ddl=True)
         with context.begin_transaction():
             context.run_migrations()

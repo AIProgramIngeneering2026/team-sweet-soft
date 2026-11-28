@@ -27,6 +27,19 @@ class InvalidTransition(CoreError):
         self.to_state = to_state
 
 
+class IdempotencyKeyConflict(CoreError):
+    """Ключ уже привязан к запросу с другим хешем. В API это 409."""
+
+    code = "idempotency_key_conflict"
+
+    def __init__(self, job_id: str) -> None:
+        super().__init__(
+            f"Ключ уже использован для другого запроса, Job '{job_id}'. "
+            "Для нового задания нужен новый ключ"
+        )
+        self.job_id = job_id
+
+
 class UnknownTool(CoreError):
     """Tool с таким именем нет в Registry. В API это 422."""
 

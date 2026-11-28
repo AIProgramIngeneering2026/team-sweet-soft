@@ -12,6 +12,7 @@ from alembic.migration import MigrationContext
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine, RowMapping
 
+from sweetsoft.core.errors import IdempotencyKeyConflict
 from sweetsoft.core.job import Job, JobState, Transition
 from sweetsoft.core.store import Job as StoredJob
 from sweetsoft.core.tool import SkippedItem, ToolResult
@@ -54,34 +55,66 @@ class SQLJobStore:
             connection.execute(text("SELECT 1 FROM job_transitions LIMIT 1")).first()
 
     def add(self, job: StoredJob) -> None:
+        with self._transaction(write=True) as connection:
+            if not self._insert_job(connection, job):
+                raise ValueError(f"Job {job.id} уже есть в хранилище")
+
+    def create_with_key(
+        self, job: StoredJob, *, key: str, request_hash: str
+    ) -> tuple[bool, StoredJob]:
+        with self._transaction(write=True) as connection:
+            if self._insert_job(connection, job, key=key, request_hash=request_hash):
+                return True, job
+
+            query = "SELECT * FROM jobs WHERE idempotency_key = :key"
+            if not self._sqlite:
+                # Держим состояние Job и историю согласованными до конца чтения.
+                query += " FOR SHARE"
+            existing = connection.execute(text(query), {"key": key}).mappings().first()
+            if existing is None:
+                raise ValueError(f"Job {job.id} уже есть в хранилище")
+            if existing["request_hash"] != request_hash:
+                raise IdempotencyKeyConflict(existing["id"])
+            return False, self._load(connection, existing)
+
+    @staticmethod
+    def _insert_job(
+        connection: Connection,
+        job: StoredJob,
+        *,
+        key: str | None = None,
+        request_hash: str | None = None,
+    ) -> bool:
         history = job.history
         created_at = history[0].at if history else datetime.now(timezone.utc)
         if created_at.tzinfo is None:
             created_at = created_at.replace(tzinfo=timezone.utc)
 
-        with self._transaction(write=True) as connection:
-            inserted = connection.execute(
-                text("""INSERT INTO jobs
-                   (id, tool, params, state, correlation_id, created_at,
-                    result, error_code, error_message)
-                   VALUES (:id, :tool, :params, :state, :correlation_id, :created_at,
-                           :result, :error_code, :error_message)
-                   ON CONFLICT (id) DO NOTHING"""),
-                {
-                    "id": job.id,
-                    "tool": job.tool,
-                    "params": json.dumps(job.params),
-                    "state": str(job.state),
-                    "correlation_id": job.correlation_id,
-                    "created_at": created_at.astimezone(timezone.utc).isoformat(timespec="microseconds"),
-                    "result": _encode_result(job.result),
-                    "error_code": job.error_code,
-                    "error_message": job.error_message,
-                },
-            )
-            if inserted.rowcount == 0:
-                raise ValueError(f"Job {job.id} уже есть в хранилище")
-            _append_history(connection, job.id, 0, history)
+        inserted = connection.execute(
+            text("""INSERT INTO jobs
+               (id, tool, params, state, correlation_id, created_at,
+                result, error_code, error_message, idempotency_key, request_hash)
+               VALUES (:id, :tool, :params, :state, :correlation_id, :created_at,
+                       :result, :error_code, :error_message, :key, :request_hash)
+               ON CONFLICT DO NOTHING"""),
+            {
+                "id": job.id,
+                "tool": job.tool,
+                "params": json.dumps(job.params),
+                "state": str(job.state),
+                "correlation_id": job.correlation_id,
+                "created_at": created_at.astimezone(timezone.utc).isoformat(timespec="microseconds"),
+                "result": _encode_result(job.result),
+                "error_code": job.error_code,
+                "error_message": job.error_message,
+                "key": key,
+                "request_hash": request_hash,
+            },
+        )
+        if inserted.rowcount == 0:
+            return False
+        _append_history(connection, job.id, 0, history)
+        return True
 
     def get(self, job_id: str) -> Job:
         with self._transaction() as connection:

@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Event
+from threading import Barrier, Event
 
 import pytest
 from alembic import command
@@ -12,8 +12,9 @@ from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from sweetsoft.core.dispatcher import INTERNAL_ERROR, RESTART_MESSAGE, recover_after_restart
-from sweetsoft.core.errors import InvalidTransition
+from sweetsoft.core.errors import IdempotencyKeyConflict, InvalidTransition
 from sweetsoft.core.job import Job, JobState
+from sweetsoft.core.store import InMemoryJobStore
 from sweetsoft.core.tool import SkippedItem, ToolResult
 from sweetsoft.storage import SQLiteJobStore
 
@@ -176,3 +177,90 @@ def test_rejected_transition_preserves_cancelled_job(migrated_db):
 
     assert store.get(queued.id) == cancelled
     assert cancelled.result is None
+
+
+@pytest.fixture(params=["memory", "sqlite"])
+def idempotent_store(request):
+    if request.param == "memory":
+        return InMemoryJobStore()
+    return SQLiteJobStore(request.getfixturevalue("migrated_db"))
+
+
+def test_create_with_key_replays_current_job_and_rejects_different_hash(idempotent_store):
+    store = idempotent_store
+    original = Job.create("arena_sync", {"bot_id": 1}, "create-id")
+    original.enqueue("queue-id")
+    candidate = Job.create("arena_sync", {"bot_id": 1}, "retry-id")
+
+    assert store.create_with_key(original, key="request-1", request_hash="a" * 64) == (True, original)
+    assert store.get(original.id) == original
+    running = store.transition(original.id, JobState.RUNNING)
+    assert store.create_with_key(candidate, key="request-1", request_hash="a" * 64) == (False, running)
+
+    with pytest.raises(IdempotencyKeyConflict) as conflict:
+        store.create_with_key(candidate, key="request-1", request_hash="b" * 64)
+    assert conflict.value.code == "idempotency_key_conflict"
+    assert conflict.value.job_id == original.id
+    with pytest.raises(KeyError):
+        store.get(candidate.id)
+
+    with pytest.raises(ValueError, match="уже есть"):
+        store.create_with_key(original, key="request-2", request_hash="a" * 64)
+    assert store.create_with_key(candidate, key="request-2", request_hash="a" * 64) == (True, candidate)
+
+
+def test_create_with_key_rolls_back_job_history_and_key(migrated_db):
+    store = SQLiteJobStore(migrated_db)
+    original = Job.create("arena_sync", {"bot_id": 1}, "create-id")
+    original.enqueue("queue-id")
+    with closing(sqlite3.connect(migrated_db)) as connection, connection:
+        connection.execute("""
+            CREATE TRIGGER reject_queued_history BEFORE INSERT ON job_transitions
+            WHEN NEW.to_state = 'queued'
+            BEGIN
+                SELECT RAISE(ABORT, 'history write failed');
+            END
+        """)
+
+    with pytest.raises(IntegrityError, match="history write failed"):
+        store.create_with_key(original, key="request-1", request_hash="a" * 64)
+    with pytest.raises(KeyError):
+        store.get(original.id)
+    with closing(sqlite3.connect(migrated_db)) as connection, connection:
+        assert connection.execute("SELECT COUNT(*) FROM job_transitions").fetchone() == (0,)
+        connection.execute("DROP TRIGGER reject_queued_history")
+
+    retry = Job.create("arena_sync", {"bot_id": 1}, "retry-id")
+    retry.enqueue("queue-id")
+    assert store.create_with_key(retry, key="request-1", request_hash="a" * 64) == (True, retry)
+    reopened = SQLiteJobStore(migrated_db)
+    assert reopened.create_with_key(original, key="request-1", request_hash="a" * 64) == (False, retry)
+
+
+def test_sqlite_workers_create_one_job_for_the_same_key(migrated_db):
+    barrier = Barrier(2, timeout=5)
+
+    def create(correlation_id):
+        store = SQLiteJobStore(migrated_db)
+        job = Job.create("arena_sync", {"bot_id": 1}, correlation_id)
+        barrier.wait()
+        return store.create_with_key(job, key="request-1", request_hash="a" * 64)
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        first, second = workers.map(create, ("first", "second"))
+
+    assert sorted((first[0], second[0])) == [False, True]
+    assert first[1] == second[1]
+    assert SQLiteJobStore(migrated_db).list_by_state(JobState.CREATED) == [first[1]]
+
+
+def test_idempotency_migration_preserves_existing_jobs(migrated_db, migration_config):
+    store = SQLiteJobStore(migrated_db)
+    existing = queued_job(store)
+    command.downgrade(migration_config, "0001_jobs")
+    command.upgrade(migration_config, "head")
+
+    assert store.get(existing.id) == existing
+    unkeyed = Job.create("arena_sync", {"bot_id": 1}, "no-key-id")
+    store.add(unkeyed)
+    assert store.get(unkeyed.id) == unkeyed

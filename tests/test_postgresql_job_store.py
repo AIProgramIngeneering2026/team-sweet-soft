@@ -12,7 +12,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.schema import CreateSchema, DropSchema
 
-from sweetsoft.core import InvalidTransition, Job, JobState, ToolResult
+from sweetsoft.core import IdempotencyKeyConflict, InvalidTransition, Job, JobState, ToolResult
 from sweetsoft.storage import PostgreSQLJobStore
 from sweetsoft.storage.settings import postgresql_url
 
@@ -133,3 +133,33 @@ def test_postgresql_worker_and_transition_races(postgres_schema):
         assert stored == finished[0]
         assert len(stored.history) == 4
         assert (stored.result is not None) == (stored.state == JobState.DONE)
+
+
+@pytest.mark.parametrize("same_hash", [True, False], ids=["replay", "conflict"])
+def test_postgresql_concurrent_create_with_key(postgres_schema, same_hash):
+    command.upgrade(Config("alembic.ini"), "head")
+    barrier = Barrier(2, timeout=5)
+    with closing(PostgreSQLJobStore(postgres_schema)) as store:
+        def create(request_hash):
+            job = Job.create("arena_sync", {"bot_id": 1}, "create-id")
+            job.enqueue("queue-id")
+            barrier.wait()
+            try:
+                return store.create_with_key(job, key="request-1", request_hash=request_hash)
+            except IdempotencyKeyConflict as exc:
+                return exc
+
+        hashes = ("a" * 64, ("a" if same_hash else "b") * 64)
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            outcomes = list(workers.map(create, hashes))
+
+        stored, = store.list_by_state(JobState.QUEUED)
+        assert [item.to_state for item in stored.history] == [JobState.CREATED, JobState.QUEUED]
+        outcomes.remove((True, stored))
+        repeated, = outcomes
+        if same_hash:
+            assert repeated == (False, stored)
+        else:
+            assert isinstance(repeated, IdempotencyKeyConflict)
+            assert repeated.code == "idempotency_key_conflict"
+            assert repeated.job_id == stored.id

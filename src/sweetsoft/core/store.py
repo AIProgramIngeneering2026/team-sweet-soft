@@ -13,6 +13,7 @@ import threading
 from collections.abc import Sequence
 from typing import Any, Protocol
 
+from sweetsoft.core.errors import IdempotencyKeyConflict
 from sweetsoft.core.job import Transition
 from sweetsoft.core.tool import ToolResult
 
@@ -54,6 +55,14 @@ class Job(Protocol):
 class JobStore(Protocol):
     def add(self, job: Job) -> None: ...
 
+    def create_with_key(self, job: Job, *, key: str, request_hash: str) -> tuple[bool, Job]:
+        """Атомарно записать Job, историю и ключ или вернуть существующий Job.
+
+        Первый элемент пары показывает, создан ли Job. При другом хеше для того же
+        ключа поднимается IdempotencyKeyConflict.
+        """
+        ...
+
     def get(self, job_id: str) -> Job:
         """Job для чтения. Менять его можно только через transition хранилища."""
         ...
@@ -82,13 +91,30 @@ class JobStore(Protocol):
 class InMemoryJobStore:
     def __init__(self) -> None:
         self._jobs: dict[str, Job] = {}  # порядок вставки это порядок создания
+        self._keys: dict[str, tuple[str, str]] = {}
         self._lock = threading.Lock()
 
     def add(self, job: Job) -> None:
         with self._lock:
-            if job.id in self._jobs:
-                raise ValueError(f"Job {job.id} уже есть в хранилище")
-            self._jobs[job.id] = job
+            self._add(job)
+
+    def create_with_key(self, job: Job, *, key: str, request_hash: str) -> tuple[bool, Job]:
+        with self._lock:
+            existing = self._keys.get(key)
+            if existing is not None:
+                job_id, saved_hash = existing
+                if saved_hash != request_hash:
+                    raise IdempotencyKeyConflict(job_id)
+                return False, self._jobs[job_id]
+
+            self._add(job)
+            self._keys[key] = (job.id, request_hash)
+            return True, job
+
+    def _add(self, job: Job) -> None:
+        if job.id in self._jobs:
+            raise ValueError(f"Job {job.id} уже есть в хранилище")
+        self._jobs[job.id] = job
 
     def get(self, job_id: str) -> Job:
         """Отдает сам объект Job, а не копию. Вызов job.transition мимо хранилища
